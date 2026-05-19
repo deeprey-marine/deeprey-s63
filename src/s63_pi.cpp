@@ -44,6 +44,7 @@
 #include "s63_pi.h"
 #include "s63chart.h"
 #include "DpS63API.h"
+#include "DpS63Identity.h"
 #include "src/myiso8211/iso8211.h"
 #include "dsa_utils.h"
 #include "json_defs.h"
@@ -508,6 +509,12 @@ int s63_pi::Init(void)
     wxLogMessage(_T("Path to OCPNsenc is: ") + g_sencutil_bin);
 
     g_benable_screenlog = g_buser_enable_screenlog;
+
+    //  Provision the device-identity store on first run (activation file,
+    //  DEVICE_ID.txt, provisioned.json). Idempotent on subsequent boots.
+    //  Failure here does not abort plugin init: charts already installed
+    //  continue to work; the UI just shows an empty device-ID handle.
+    DpS63::DpS63Identity::EnsureProvisioned();
 
     //  Deeprey integration: create the API object and publish its pointer so
     //  deeprey-gui can drive S63 chart management from its settings UI.
@@ -2005,16 +2012,24 @@ int s63_pi::ImportCellPermits(void)
             }
 
             if(b_update){
-                wxString msg = _("Update all existing cell permits?");
-                int dret = OCPNMessageBox_PlugIn(GetOCPNCanvasWindow(), msg,
-                                                 _("s63_pi Message"),  wxCANCEL | wxYES_NO, -1, -1);
+                // API-driven imports (DpS63API::ImportFromUsb) always treat
+                // re-imports as renewals -- no modal prompt. Interactive
+                // imports keep the original confirmation dialog.
+                if(!m_apiPermitFileOverride.IsEmpty()){
+                    b_yes_to_all = true;
+                }
+                else{
+                    wxString msg = _("Update all existing cell permits?");
+                    int dret = OCPNMessageBox_PlugIn(GetOCPNCanvasWindow(), msg,
+                                                     _("s63_pi Message"),  wxCANCEL | wxYES_NO, -1, -1);
 
-                 if(wxID_CANCEL == dret)
-                     goto over_loop;
-                 else if(wxID_YES == dret)
-                     b_yes_to_all = true;
-                 else
-                     b_yes_to_all = false;
+                     if(wxID_CANCEL == dret)
+                         goto over_loop;
+                     else if(wxID_YES == dret)
+                         b_yes_to_all = true;
+                     else
+                         b_yes_to_all = false;
+                }
             }
         }
     }

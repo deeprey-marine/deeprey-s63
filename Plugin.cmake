@@ -82,6 +82,7 @@ set(SRC_CORE
     src/TexFont.cpp
     src/InstallDirs.cpp
     src/DpS63API.cpp
+    src/DpS63Identity.cpp
 )
 
 set(HEADERS_CORE
@@ -93,6 +94,7 @@ set(HEADERS_CORE
     src/bbox.h
     src/pi_s52s57.h
     src/triangulate.h
+    src/DpS63Identity.h
     deeprey-api/s63/DpS63API.h
     deeprey-api/s63/DpS63Types.h
 )

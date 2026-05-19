@@ -27,6 +27,7 @@
 
 #include "s63_pi.h"
 #include "DpS63API.h"
+#include "DpS63Identity.h"
 
 //  Globals owned by s63_pi.cpp.
 extern wxString g_userpermit;
@@ -211,6 +212,60 @@ bool DpS63API::SetInstallpermit(const wxString& installpermit) {
     return true;
 }
 
+wxString DpS63API::GetDeviceIdString() const {
+    return DpS63Identity::GetDeviceId();
+}
+
+void DpS63API::ExportActivationFileToUsb(const wxString& usbMountPath,
+                                         ExportCompleteCallback onComplete) {
+    auto fail = [&](const wxString& msg) {
+        if (onComplete) onComplete(false, msg);
+    };
+
+    if (usbMountPath.IsEmpty() || !wxDir::Exists(usbMountPath)) {
+        fail(_("USB drive not found."));
+        return;
+    }
+
+    //  Identity may not have been provisioned at plugin init (e.g. OCPNsenc
+    //  unavailable). Retry now -- if it still fails, surface a clear error.
+    if (!DpS63Identity::EnsureProvisioned()) {
+        fail(_("Could not generate the activation file. Check that OCPNsenc is installed."));
+        return;
+    }
+
+    wxString fprSrc = DpS63Identity::GetFingerprintPath();
+    wxString handle = DpS63Identity::GetDeviceId();
+    if (!wxFileExists(fprSrc) || handle.IsEmpty()) {
+        fail(_("Activation file is not available."));
+        return;
+    }
+
+    wxString dest = usbMountPath;
+    if (dest.Last() != wxFileName::GetPathSeparator())
+        dest += wxFileName::GetPathSeparator();
+
+    wxString fprDest = dest + _T("fingerprint.fpr");
+    if (!::wxCopyFile(fprSrc, fprDest, true /*overwrite*/)) {
+        fail(_("Could not write to the USB drive."));
+        return;
+    }
+
+    wxString idDest = dest + _T("DEVICE_ID.txt");
+    wxTextFile idTxt(idDest);
+    if (idTxt.Exists()) ::wxRemoveFile(idDest);
+    if (!idTxt.Create()) {
+        fail(_("Could not write DEVICE_ID.txt to the USB drive."));
+        return;
+    }
+    idTxt.AddLine(handle);
+    idTxt.Write();
+    idTxt.Close();
+
+    if (onComplete)
+        onComplete(true, _("Saved activation file to USB."));
+}
+
 wxString DpS63API::CreateFingerprintFile(const wxString& targetDir) {
     wxString dir = targetDir;
     if (dir.IsEmpty()) return wxString();
@@ -290,6 +345,244 @@ void DpS63API::ImportCells(const wxString& cellSourceDir,
     if (onComplete)
         onComplete(result, rv == 0 ? _("Cells imported")
                                    : _("Cell import failed"));
+}
+
+// ---------------------------------------------------------------------------
+//  USB bundle import (single-call orchestration)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Case-insensitive search for fileName directly under dir. Returns absolute
+// path or empty string. (S63 bundles use upper-case names per spec, but USB
+// filesystems may have lower-cased them.)
+wxString FindFileAt(const wxString& dir, const wxString& fileName) {
+    wxDir d(dir);
+    if (!d.IsOpened()) return wxString();
+    wxString hit;
+    if (d.GetFirst(&hit, wxEmptyString, wxDIR_FILES)) {
+        do {
+            if (hit.IsSameAs(fileName, false))
+                return dir + wxFileName::GetPathSeparator() + hit;
+        } while (d.GetNext(&hit));
+    }
+    return wxString();
+}
+
+wxString FindDirAt(const wxString& dir, const wxString& dirName) {
+    wxDir d(dir);
+    if (!d.IsOpened()) return wxString();
+    wxString hit;
+    if (d.GetFirst(&hit, wxEmptyString, wxDIR_DIRS)) {
+        do {
+            if (hit.IsSameAs(dirName, false))
+                return dir + wxFileName::GetPathSeparator() + hit;
+        } while (d.GetNext(&hit));
+    }
+    return wxString();
+}
+
+// Read the first non-empty trimmed line of a text file. Empty string if not
+// readable.
+wxString ReadFirstNonEmptyLine(const wxString& path) {
+    wxTextFile f(path);
+    if (!f.Open()) return wxString();
+    for (wxString line = f.GetFirstLine(); !f.Eof();
+         line = f.GetNextLine()) {
+        line.Trim().Trim(false);
+        if (!line.IsEmpty()) return line;
+    }
+    // Last line (the loop above stops before reading the final line if file
+    // has no trailing newline).
+    wxString last = f.GetLastLine();
+    last.Trim().Trim(false);
+    return last;
+}
+
+// Discover a userpermit + installpermit pair on the USB. Tries (in order)
+// sibling USERPERMIT.TXT / INSTALLPERMIT.TXT files, then a KEYS.TXT with two
+// lines. Returns true if both values were found.
+bool ScanUsbForActivationKeys(const wxString& usbDir,
+                              wxString& outUser, wxString& outInstall) {
+    outUser.Clear();
+    outInstall.Clear();
+
+    wxString userPath = FindFileAt(usbDir, "USERPERMIT.TXT");
+    wxString instPath = FindFileAt(usbDir, "INSTALLPERMIT.TXT");
+    if (!userPath.IsEmpty() && !instPath.IsEmpty()) {
+        outUser = ReadFirstNonEmptyLine(userPath);
+        outInstall = ReadFirstNonEmptyLine(instPath);
+        return !outUser.IsEmpty() && !outInstall.IsEmpty();
+    }
+
+    wxString keysPath = FindFileAt(usbDir, "KEYS.TXT");
+    if (!keysPath.IsEmpty()) {
+        wxTextFile f(keysPath);
+        if (f.Open()) {
+            wxArrayString nonEmpty;
+            for (wxString line = f.GetFirstLine(); !f.Eof();
+                 line = f.GetNextLine()) {
+                line.Trim().Trim(false);
+                if (!line.IsEmpty()) nonEmpty.Add(line);
+            }
+            wxString tail = f.GetLastLine();
+            tail.Trim().Trim(false);
+            if (!tail.IsEmpty()) nonEmpty.Add(tail);
+            if (nonEmpty.GetCount() >= 2) {
+                outUser = nonEmpty[0];
+                outInstall = nonEmpty[1];
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Count cell-permit lines under :ENC sections in a PERMIT.TXT. Used to size
+// the post-import diff.
+std::vector<wxString> ListCellNamesInPermitFile(const wxString& permitFile) {
+    std::vector<wxString> names;
+    wxTextFile f(permitFile);
+    if (!f.Open()) return names;
+    bool inEnc = false;
+    for (wxString line = f.GetFirstLine(); !f.Eof();
+         line = f.GetNextLine()) {
+        if (line.StartsWith(":ENC")) { inEnc = true; continue; }
+        if (line.StartsWith(":"))    { inEnc = false; continue; }
+        if (!inEnc) continue;
+        wxString s = line; s.Trim().Trim(false);
+        if (s.Len() >= 8) names.push_back(s.Mid(0, 8));
+    }
+    return names;
+}
+
+}  // namespace
+
+void DpS63API::ImportFromUsb(const wxString& usbMountPath,
+                             ImportProgressCallback onProgress,
+                             ImportCompleteCallback onComplete) {
+    auto report = [&](DpS63ImportResult r, const wxString& summary,
+                      int added, int updated, int failed) {
+        if (onComplete) onComplete(r, summary, added, updated, failed);
+    };
+    auto stage = [&](int pct, const wxString& msg) {
+        if (onProgress) onProgress(pct, msg);
+    };
+
+    if (!m_plugin || usbMountPath.IsEmpty() || !wxDir::Exists(usbMountPath)) {
+        report(DpS63ImportResult::UNKNOWN_ERROR,
+               _("USB drive not found."), 0, 0, 0);
+        return;
+    }
+
+    stage(2, _("Scanning USB..."));
+
+    wxString permitFile = FindFileAt(usbMountPath, "PERMIT.TXT");
+    wxString encRoot    = FindDirAt(usbMountPath, "ENC_ROOT");
+    if (permitFile.IsEmpty() || encRoot.IsEmpty()) {
+        report(DpS63ImportResult::BAD_PERMIT_FILE,
+               _("USB does not contain a valid S63 chart bundle "
+                 "(PERMIT.TXT and ENC_ROOT/ are required)."),
+               0, 0, 0);
+        return;
+    }
+
+    //  1. Pick up activation keys from the bundle if a fresh pair is offered.
+    //     This is the path that lets the user move between chart authorities
+    //     without ever typing a hex string.
+    stage(8, _("Reading activation keys..."));
+    {
+        wxString user, inst;
+        if (ScanUsbForActivationKeys(usbMountPath, user, inst)) {
+            if (user != g_userpermit)    SetUserpermit(user);
+            if (inst != g_installpermit) SetInstallpermit(inst);
+        }
+    }
+
+    //  2. Import any loose .PUB certificates shipped alongside the bundle so
+    //     cell signatures can authenticate. Failures here are logged but not
+    //     fatal -- the IHO default certificate covers most bundles.
+    stage(15, _("Importing certificates..."));
+    {
+        wxArrayString pubs;
+        wxDir::GetAllFiles(usbMountPath, &pubs, "*.PUB", wxDIR_FILES);
+        for (const wxString& pub : pubs) ImportCertificate(pub);
+    }
+
+    //  Count cells present before this import so we can compute added vs
+    //  updated after the permit-write step completes.
+    std::vector<wxString> cellsBefore;
+    for (const DpS63CellInfo& c : GetInstalledCells())
+        cellsBefore.push_back(c.cellName);
+
+    //  3. Validate and persist permits. The plugin's ImportCellPermits writes
+    //     .os63 metadata under <ChartDir>/<DataServerID>/.
+    stage(30, _("Validating permits..."));
+    m_plugin->m_apiPermitFileOverride = permitFile;
+    int permitRv = m_plugin->ImportCellPermits();
+    m_plugin->m_apiPermitFileOverride.Clear();
+    if (permitRv != 0) {
+        NotifyStateChanged();
+        report(DpS63ImportResult::NO_USERPERMIT,
+               _("Activation keys are missing or invalid. "
+                 "Make sure the USB carries the keys for this device."),
+               0, 0, 0);
+        return;
+    }
+
+    //  4. Decrypt cells. OCPNsenc is invoked per cell base + update; the
+    //     plugin handles authentication against publisher certificates.
+    stage(60, _("Decrypting cells..."));
+    m_plugin->m_apiEncRootOverride = encRoot;
+    int cellRv = m_plugin->ImportCells();
+    m_plugin->m_apiEncRootOverride.Clear();
+
+    NotifyStateChanged();
+    stage(100, _("Finishing..."));
+
+    //  Diff before/after to break the result down into added / updated and
+    //  classify any cell permits in PERMIT.TXT that did not land as failed.
+    std::vector<wxString> permitCells = ListCellNamesInPermitFile(permitFile);
+    std::vector<wxString> cellsAfter;
+    for (const DpS63CellInfo& c : GetInstalledCells())
+        cellsAfter.push_back(c.cellName);
+
+    auto contains = [](const std::vector<wxString>& v, const wxString& s) {
+        for (const auto& x : v) if (x.IsSameAs(s, false)) return true;
+        return false;
+    };
+
+    int added = 0, updated = 0, failed = 0;
+    for (const wxString& name : permitCells) {
+        bool wasBefore = contains(cellsBefore, name);
+        bool isAfter   = contains(cellsAfter, name);
+        if (isAfter && !wasBefore) ++added;
+        else if (isAfter && wasBefore) ++updated;
+        else ++failed;
+    }
+
+    DpS63ImportResult result;
+    wxString summary;
+    if (cellRv != 0 || failed > 0) {
+        result = (added + updated > 0)
+                     ? DpS63ImportResult::PARTIAL
+                     : DpS63ImportResult::SENC_BUILD_FAILED;
+        summary = wxString::Format(
+            _("Imported %d new, updated %d. %d failed -- see log for details."),
+            added, updated, failed);
+    } else {
+        result = DpS63ImportResult::SUCCESS;
+        if (added > 0 && updated > 0)
+            summary = wxString::Format(
+                _("Imported %d new charts, updated %d."), added, updated);
+        else if (added > 0)
+            summary = wxString::Format(_("Imported %d new charts."), added);
+        else if (updated > 0)
+            summary = wxString::Format(_("Updated %d charts."), updated);
+        else
+            summary = _("No new charts to import.");
+    }
+    report(result, summary, added, updated, failed);
 }
 
 // ---------------------------------------------------------------------------
