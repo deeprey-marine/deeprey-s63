@@ -298,9 +298,10 @@ void DpS63API::RequestActivation(ActivationProgressCallback onProgress,
         return;
     }
 
-    //  1. Build the activation request (FPRU) from the device's secure module.
-    //     OCPNsenc -j writes the request file into an output directory and
-    //     prints its path; the file contents are the JSON body to POST.
+    //  1. Build the activation request from the device's secure module (TPM).
+    //     OCPNsenc -j (v2.00+) writes the complete JSON request body
+    //     ({dev, fpr, fprn, t}) directly to the -o output file, with the md5
+    //     token computed using OCPNsenc's embedded salt.
     stage(10, _("Preparing activation request..."));
 
     wxString deviceId = DpS63Identity::GetDeviceId();
@@ -313,35 +314,26 @@ void DpS63API::RequestActivation(ActivationProgressCallback onProgress,
     wxString outDir = DpS63Identity::GetIdentityDir();
     if (!wxFileName::DirExists(outDir))
         wxFileName::Mkdir(outDir, 0755, wxPATH_MKDIR_FULL);
+    wxString reqPath = outDir + _T("activation_request.json");
+    if (wxFileExists(reqPath)) ::wxRemoveFile(reqPath);
 
-    wxString cmd = _T(" -j -i \"") + deviceId + _T("\" -o \"") + outDir + _T("\"");
-    wxArrayString out = exec_SENCutil_sync(cmd, false);
+    wxString cmd = _T(" -j -i \"") + deviceId + _T("\" -o \"") + reqPath + _T("\"");
+    exec_SENCutil_sync(cmd, false);
 
-    wxString reqPath;
-    for (const wxString& line : out) {
-        if (line.Upper().Find(_T("ERROR")) != wxNOT_FOUND) { reqPath.Clear(); break; }
-        if (line.Upper().Find(_T("FPR")) != wxNOT_FOUND) {
-            wxString p = line.AfterFirst(':');
-            p.Trim().Trim(false);
-            if (wxFileExists(p)) reqPath = p;
-        }
+    //  OCPNsenc's exit status is unreliable here (it logs TPM TCTI lines even on
+    //  success), so the reliable success signal is the request file being
+    //  written with JSON content.
+    wxString requestJson;
+    if (wxFileExists(reqPath)) {
+        wxFFile f(reqPath, "rb");
+        if (f.IsOpened()) f.ReadAll(&requestJson);
+        ::wxRemoveFile(reqPath);
     }
-    if (reqPath.IsEmpty()) {
+    requestJson.Trim().Trim(false);
+    if (!requestJson.StartsWith(_T("{"))) {
         done(DpS63ActivationResult::FPR_FAILED,
              _("Could not prepare the activation request. The secure module "
                "may be unavailable on this device."));
-        return;
-    }
-
-    wxString requestJson;
-    {
-        wxFFile f(reqPath, "rb");
-        if (f.IsOpened()) f.ReadAll(&requestJson);
-    }
-    ::wxRemoveFile(reqPath);
-    if (requestJson.Trim().IsEmpty()) {
-        done(DpS63ActivationResult::FPR_FAILED,
-             _("The activation request could not be read."));
         return;
     }
 
