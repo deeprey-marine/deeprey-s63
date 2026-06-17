@@ -41,6 +41,11 @@ include_directories("${CMAKE_CURRENT_SOURCE_DIR}/deeprey-api/s63")
 add_subdirectory("opencpn-libs/${PKG_API_LIB}")
 target_link_libraries(${CMAKE_PROJECT_NAME} ocpn::api)
 
+# libcurl: on-demand S63 activation POSTs the TPM-built request to the
+# o-charts chart-shop server (DpS63API::RequestActivation).
+find_package(CURL REQUIRED)
+target_link_libraries(${CMAKE_PROJECT_NAME} CURL::libcurl)
+
 set(VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
 set(VERSION_MINOR ${PROJECT_VERSION_MINOR})
 set(VERSION_PATCH ${PROJECT_VERSION_PATCH})

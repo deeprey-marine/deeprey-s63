@@ -35,6 +35,31 @@ namespace {
 
 wxString s_cachedDeviceId;
 
+// The fleet-provisioned MFD serial ("MFD-YY-NNNNNN-C"), written by
+// deeprey-provision to the STATE partition on first boot. This is the
+// identifier o-charts has on file for the device, so it is what S63 activation
+// sends and what the UI shows as the Device ID. Only present on a provisioned
+// MFD; absent on a dev workstation.
+const char* const kFleetSerialPath = "/state/identity/serial";
+
+wxString s_cachedSerial;
+bool s_serialChecked = false;
+
+wxString ReadFleetSerial() {
+    if (s_serialChecked) return s_cachedSerial;
+    s_serialChecked = true;
+
+    if (wxFileExists(kFleetSerialPath)) {
+        wxFFile f(kFleetSerialPath, "rb");
+        wxString s;
+        if (f.IsOpened() && f.ReadAll(&s)) {
+            s.Trim().Trim(false);
+            if (!s.IsEmpty()) s_cachedSerial = s;
+        }
+    }
+    return s_cachedSerial;
+}
+
 // SHA-1 over the bytes of filePath. Returns 20 raw bytes in digest[]; false if
 // the file could not be read.
 bool Sha1OfFile(const wxString& filePath, uint8_t digest[SHA1HashSize]) {
@@ -171,6 +196,13 @@ wxString DpS63Identity::GetFingerprintPath() {
 }
 
 wxString DpS63Identity::GetDeviceId() {
+    // Prefer the fleet-assigned MFD serial -- the identifier agreed with
+    // o-charts and used for activation. On a dev workstation (no STATE
+    // partition) fall back to the FPR-derived handle so the UI still shows
+    // a stable identifier.
+    wxString serial = ReadFleetSerial();
+    if (!serial.IsEmpty()) return serial;
+
     if (s_cachedDeviceId.IsEmpty()) LoadCachedDeviceId();
     return s_cachedDeviceId;
 }

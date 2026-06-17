@@ -21,19 +21,82 @@
 #endif
 
 #include <wx/dir.h>
+#include <wx/ffile.h>
 #include <wx/filename.h>
 #include <wx/textfile.h>
 #include <wx/tokenzr.h>
 
+#include <string>
+
+#include <curl/curl.h>
+
 #include "s63_pi.h"
 #include "DpS63API.h"
 #include "DpS63Identity.h"
+#include "jsonreader.h"
+#include "jsonval.h"
 
 //  Globals owned by s63_pi.cpp.
 extern wxString g_userpermit;
 extern wxString g_installpermit;
 extern wxString g_fpr_file;
 extern wxString g_SENCdir;
+extern wxString g_shop_base_url;
+extern wxString g_activation_token;
+
+namespace {
+
+// libcurl write callback: append the received bytes to a std::string.
+size_t CurlAppend(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    std::string* out = static_cast<std::string*>(userdata);
+    out->append(ptr, size * nmemb);
+    return size * nmemb;
+}
+
+// POST jsonBody to url with "Content-Type: application/json". Fills response
+// with the body and httpCode with the status. Returns true only on a 2xx
+// response; on transport failure httpCode is left 0 and netErr describes it.
+bool HttpPostJson(const wxString& url, const wxString& jsonBody,
+                  wxString& response, long& httpCode, wxString& netErr) {
+    httpCode = 0;
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        netErr = "curl init failed";
+        return false;
+    }
+
+    std::string body(jsonBody.utf8_str());
+    std::string resp;
+    struct curl_slist* headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    headers = curl_slist_append(headers, "Accept: application/json");
+
+    curl_easy_setopt(curl, CURLOPT_URL, static_cast<const char*>(url.utf8_str()));
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlAppend);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "deeprey-s63");
+
+    CURLcode rc = curl_easy_perform(curl);
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (rc != CURLE_OK) {
+        netErr = wxString::FromUTF8(curl_easy_strerror(rc));
+        return false;
+    }
+    response = wxString::FromUTF8(resp.c_str());
+    return httpCode >= 200 && httpCode < 300;
+}
+
+}  // namespace
 
 namespace DpS63 {
 
@@ -210,6 +273,147 @@ bool DpS63API::SetInstallpermit(const wxString& installpermit) {
     m_plugin->SaveConfig();
     NotifyStateChanged();
     return true;
+}
+
+// Scan OCPNsenc output for an "ERROR" marker (the convention every utility
+// command follows) -- true if any line reports an error.
+static bool SencOutputHasError(const wxArrayString& out) {
+    for (const wxString& line : out)
+        if (line.Upper().Find(_T("ERROR")) != wxNOT_FOUND) return true;
+    return false;
+}
+
+void DpS63API::RequestActivation(ActivationProgressCallback onProgress,
+                                 ActivationCompleteCallback onComplete) {
+    auto stage = [&](int pct, const wxString& msg) {
+        if (onProgress) onProgress(pct, msg);
+    };
+    auto done = [&](DpS63ActivationResult r, const wxString& msg) {
+        if (onComplete) onComplete(r, msg);
+    };
+
+    if (!m_plugin) {
+        done(DpS63ActivationResult::UNKNOWN_ERROR,
+             _("The S63 plugin is not available."));
+        return;
+    }
+
+    //  1. Build the activation request (FPRU) from the device's secure module.
+    //     OCPNsenc -j writes the request file into an output directory and
+    //     prints its path; the file contents are the JSON body to POST.
+    stage(10, _("Preparing activation request..."));
+
+    wxString deviceId = DpS63Identity::GetDeviceId();
+    if (deviceId.IsEmpty()) {
+        DpS63Identity::EnsureProvisioned();
+        deviceId = DpS63Identity::GetDeviceId();
+    }
+    if (deviceId.IsEmpty()) deviceId = _T("MFD");
+
+    wxString outDir = DpS63Identity::GetIdentityDir();
+    if (!wxFileName::DirExists(outDir))
+        wxFileName::Mkdir(outDir, 0755, wxPATH_MKDIR_FULL);
+
+    wxString cmd = _T(" -j -i \"") + deviceId + _T("\" -o \"") + outDir + _T("\"");
+    wxArrayString out = exec_SENCutil_sync(cmd, false);
+
+    wxString reqPath;
+    for (const wxString& line : out) {
+        if (line.Upper().Find(_T("ERROR")) != wxNOT_FOUND) { reqPath.Clear(); break; }
+        if (line.Upper().Find(_T("FPR")) != wxNOT_FOUND) {
+            wxString p = line.AfterFirst(':');
+            p.Trim().Trim(false);
+            if (wxFileExists(p)) reqPath = p;
+        }
+    }
+    if (reqPath.IsEmpty()) {
+        done(DpS63ActivationResult::FPR_FAILED,
+             _("Could not prepare the activation request. The secure module "
+               "may be unavailable on this device."));
+        return;
+    }
+
+    wxString requestJson;
+    {
+        wxFFile f(reqPath, "rb");
+        if (f.IsOpened()) f.ReadAll(&requestJson);
+    }
+    ::wxRemoveFile(reqPath);
+    if (requestJson.Trim().IsEmpty()) {
+        done(DpS63ActivationResult::FPR_FAILED,
+             _("The activation request could not be read."));
+        return;
+    }
+
+    //  2. POST the request to the o-charts chart-shop server.
+    stage(40, _("Contacting the chart shop..."));
+
+    wxString base = g_shop_base_url;
+    if (base.IsEmpty()) base = _T("https://test.o-charts.org");
+    while (!base.IsEmpty() && base.Last() == '/') base.RemoveLast();
+    wxString url = base + _T("/shop/en/module/ocpermits/request");
+
+    wxString response;
+    long httpCode = 0;
+    wxString netErr;
+    if (!HttpPostJson(url, requestJson, response, httpCode, netErr)) {
+        if (httpCode == 0) {
+            done(DpS63ActivationResult::NO_NETWORK,
+                 _("Could not reach the chart shop. Check the internet "
+                   "connection and try again."));
+        } else {
+            done(DpS63ActivationResult::SERVER_ERROR,
+                 wxString::Format(
+                     _("The chart shop reported a problem (status %ld)."),
+                     httpCode));
+        }
+        return;
+    }
+
+    //  3. Parse the returned { "up", "ip", "t" }.
+    stage(70, _("Reading activation keys..."));
+
+    wxJSONValue root;
+    wxJSONReader reader;
+    if (reader.Parse(response, &root) != 0 ||
+        !root.HasMember("up") || !root.HasMember("ip")) {
+        done(DpS63ActivationResult::BAD_RESPONSE,
+             _("The chart shop response could not be read."));
+        return;
+    }
+    wxString up = root["up"].AsString();
+    wxString ip = root["ip"].AsString();
+    wxString token = root.HasMember("t") ? root["t"].AsString() : wxString();
+    up.Trim().Trim(false);
+    ip.Trim().Trim(false);
+    if (up.IsEmpty() || ip.IsEmpty()) {
+        done(DpS63ActivationResult::BAD_RESPONSE,
+             _("The chart shop did not return valid activation keys."));
+        return;
+    }
+
+    //  4. Validate the returned permits against this device (OCPNsenc -k).
+    stage(85, _("Validating activation..."));
+
+    wxString vcmd = _T(" -k -u ") + up + _T(" -e ") + ip;
+    wxArrayString vout = exec_SENCutil_sync(vcmd, false);
+    if (SencOutputHasError(vout)) {
+        done(DpS63ActivationResult::VALIDATION_FAILED,
+             _("The activation keys could not be validated for this device."));
+        return;
+    }
+
+    //  5. Persist the activation. The user/install permits become the active
+    //     credentials used by every cell-permit and cell-decrypt operation.
+    stage(95, _("Finishing..."));
+    g_userpermit = up;
+    g_installpermit = ip;
+    g_activation_token = token;
+    m_plugin->SaveConfig();
+    NotifyStateChanged();
+
+    stage(100, _("Done."));
+    done(DpS63ActivationResult::SUCCESS, _("S63 charts activated."));
 }
 
 wxString DpS63API::GetDeviceIdString() const {

@@ -95,6 +95,8 @@ bool                            g_bdisable_infowin;
 
 wxString                        g_userpermit;
 wxString                        g_installpermit;
+wxString                        g_shop_base_url;
+wxString                        g_activation_token;
 s63_pi                          *g_pi;
 wxString                        g_pi_filename;
 wxString                        g_SENCdir;
@@ -2519,6 +2521,7 @@ bool s63_pi::LoadConfig( void )
         //      Defaults
         g_installpermit = _T("Y");
         g_userpermit = _T("X");
+        g_shop_base_url = _T("https://test.o-charts.org");
 
         pConf->Read( _T("PermitDir"), &m_SelectPermit_dir );
         pConf->Read( _T("Userpermit"), &g_userpermit );
@@ -2528,6 +2531,8 @@ bool s63_pi::LoadConfig( void )
         pConf->Read( _T("ShowScreenLog"), &g_buser_enable_screenlog);
         pConf->Read( _T("NoShowSSE25"), &g_bnoShow_sse25);
         pConf->Read( _T("LastFPRFile"), &g_fpr_file);
+        pConf->Read( _T("ShopBaseUrl"), &g_shop_base_url, g_shop_base_url);
+        pConf->Read( _T("ActivationToken"), &g_activation_token);
     }
 
     return true;
@@ -2545,6 +2550,8 @@ bool s63_pi::SaveConfig( void )
         pConf->Write( _T("Installpermit"), g_installpermit );
         pConf->Write( _T("LastENCROOT"), m_last_enc_root_dir );
         pConf->Write( _T("LastFPRFile"), g_fpr_file );
+        pConf->Write( _T("ShopBaseUrl"), g_shop_base_url );
+        pConf->Write( _T("ActivationToken"), g_activation_token );
 
     }
 
