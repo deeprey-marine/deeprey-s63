@@ -89,12 +89,19 @@ bool HttpPostJson(const wxString& url, const wxString& jsonBody,
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
 
+    response = wxString::FromUTF8(resp.c_str());
+
     if (rc != CURLE_OK) {
         netErr = wxString::FromUTF8(curl_easy_strerror(rc));
+        wxLogMessage(_T("DpS63 HTTP %s -> transport error rc=%d (%s)"),
+                     url.c_str(), (int)rc, netErr.c_str());
         return false;
     }
-    response = wxString::FromUTF8(resp.c_str());
-    return httpCode >= 200 && httpCode < 300;
+    if (httpCode < 200 || httpCode >= 300) {
+        wxLogMessage(_T("DpS63 HTTP %s -> status %ld"), url.c_str(), httpCode);
+        return false;
+    }
+    return true;
 }
 
 }  // namespace
@@ -305,6 +312,17 @@ static wxString SencComputeToken(const wxString& input) {
     return wxString();
 }
 
+// Read a string member from a wxJSON object. The bundled wxJSON (src/wxJSON)
+// has HasMember(), Get() and GetMemberNames() stubbed out -- their map-lookup
+// bodies are commented, so they always report "not present" even when the
+// member exists (Size() and operator[] still work). Member access therefore has
+// to go through operator[], which reads the internal map directly; a missing key
+// auto-inserts an invalid value that IsString() correctly rejects.
+static wxString JsonStr(wxJSONValue& obj, const wxChar* key) {
+    wxJSONValue& v = obj[key];
+    return v.IsString() ? v.AsString() : wxString();
+}
+
 void DpS63API::RequestActivation(ActivationProgressCallback onProgress,
                                  ActivationCompleteCallback onComplete) {
     auto stage = [&](int pct, const wxString& msg) {
@@ -389,15 +407,14 @@ void DpS63API::RequestActivation(ActivationProgressCallback onProgress,
 
     wxJSONValue root;
     wxJSONReader reader;
-    if (reader.Parse(response, &root) != 0 ||
-        !root.HasMember("up") || !root.HasMember("ip")) {
+    if (reader.Parse(response, &root) != 0 || !root.IsObject()) {
         done(DpS63ActivationResult::BAD_RESPONSE,
              _("The chart shop response could not be read."));
         return;
     }
-    wxString up = root["up"].AsString();
-    wxString ip = root["ip"].AsString();
-    wxString token = root.HasMember("t") ? root["t"].AsString() : wxString();
+    wxString up = JsonStr(root, _T("up"));
+    wxString ip = JsonStr(root, _T("ip"));
+    wxString token = JsonStr(root, _T("t"));
     up.Trim().Trim(false);
     ip.Trim().Trim(false);
     token.Trim().Trim(false);
@@ -472,11 +489,12 @@ void DpS63API::RequestActivation(ActivationProgressCallback onProgress,
             //  token; mismatch is logged, not fatal (see step 3 rationale).
             wxJSONValue croot;
             wxJSONReader creader;
-            if (creader.Parse(cresp, &croot) == 0 &&
-                croot.HasMember("datetime")) {
-                wxString datetime = croot["datetime"].AsString();
-                wxString ctok = croot.HasMember("t") ? croot["t"].AsString()
-                                                     : wxString();
+            wxString datetime = (creader.Parse(cresp, &croot) == 0 &&
+                                 croot.IsObject())
+                                    ? JsonStr(croot, _T("datetime"))
+                                    : wxString();
+            if (!datetime.IsEmpty()) {
+                wxString ctok = JsonStr(croot, _T("t"));
                 datetime.Trim().Trim(false);
                 ctok.Trim().Trim(false);
                 if (!ctok.IsEmpty()) {
