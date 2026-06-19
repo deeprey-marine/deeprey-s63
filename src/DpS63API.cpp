@@ -35,6 +35,7 @@
 #include "DpS63Identity.h"
 #include "jsonreader.h"
 #include "jsonval.h"
+#include "jsonwriter.h"
 
 //  Globals owned by s63_pi.cpp.
 extern wxString g_userpermit;
@@ -283,6 +284,27 @@ static bool SencOutputHasError(const wxArrayString& out) {
     return false;
 }
 
+// Run OCPNsenc -x -i <input> (v2.01+), which prints md5(input + salt) using
+// OCPNsenc's embedded server salt. Returns the lowercase 32-char hex digest, or
+// an empty string if the tool produced none. The md5 salt is a server secret
+// baked into OCPNsenc, so the open-source plugin uses this to build the
+// /confirm request token and to verify shop response tokens -- it cannot
+// compute any of these itself.
+static wxString SencComputeToken(const wxString& input) {
+    wxString cmd = _T(" -x -i \"") + input + _T("\"");
+    wxArrayString out = exec_SENCutil_sync(cmd, false);
+    for (const wxString& line : out) {
+        wxString t = line;
+        t.Trim().Trim(false);
+        if (t.Len() != 32) continue;
+        bool hex = true;
+        for (size_t i = 0; i < t.Len(); ++i)
+            if (!wxIsxdigit(t[i])) { hex = false; break; }
+        if (hex) return t.Lower();
+    }
+    return wxString();
+}
+
 void DpS63API::RequestActivation(ActivationProgressCallback onProgress,
                                  ActivationCompleteCallback onComplete) {
     auto stage = [&](int pct, const wxString& msg) {
@@ -378,10 +400,24 @@ void DpS63API::RequestActivation(ActivationProgressCallback onProgress,
     wxString token = root.HasMember("t") ? root["t"].AsString() : wxString();
     up.Trim().Trim(false);
     ip.Trim().Trim(false);
+    token.Trim().Trim(false);
     if (up.IsEmpty() || ip.IsEmpty()) {
         done(DpS63ActivationResult::BAD_RESPONSE,
              _("The chart shop did not return valid activation keys."));
         return;
+    }
+
+    //  Verify the response token: t = md5(ip + dev + salt). The cryptographic
+    //  gate is the OCPNsenc -k validation below (it binds the install permit to
+    //  this device's TPM); this token check is an authenticity guard on the shop
+    //  response, so a mismatch is logged rather than fatal.
+    if (!token.IsEmpty()) {
+        wxString expected = SencComputeToken(ip + deviceId);
+        if (!expected.IsEmpty() && !expected.IsSameAs(token, false)) {
+            wxLogMessage(_T("DpS63: /request response token mismatch ")
+                         _T("(got %s, expected %s)"),
+                         token.c_str(), expected.c_str());
+        }
     }
 
     //  4. Validate the returned permits against this device (OCPNsenc -k).
@@ -397,12 +433,69 @@ void DpS63API::RequestActivation(ActivationProgressCallback onProgress,
 
     //  5. Persist the activation. The user/install permits become the active
     //     credentials used by every cell-permit and cell-decrypt operation.
-    stage(95, _("Finishing..."));
+    stage(90, _("Finishing..."));
     g_userpermit = up;
     g_installpermit = ip;
     g_activation_token = token;
     m_plugin->SaveConfig();
     NotifyStateChanged();
+
+    //  6. Confirm the activation. POST { dev, t = md5(dev + salt) } to /confirm,
+    //     which records the operation for billing. It is idempotent, so a
+    //     failure here is non-fatal: the device is already activated and a later
+    //     re-activation will record it. The permits above are what make the
+    //     charts usable, so we never fail the activation on a confirm hiccup.
+    stage(95, _("Confirming activation..."));
+
+    wxString confirmTok = SencComputeToken(deviceId);
+    if (confirmTok.IsEmpty()) {
+        wxLogMessage(_T("DpS63: could not build /confirm token; ")
+                     _T("skipping confirm (activation still valid)."));
+    } else {
+        wxJSONValue creq;
+        creq["dev"] = deviceId;
+        creq["t"] = confirmTok;
+        wxJSONWriter writer(wxJSONWRITER_NONE);
+        wxString cbody;
+        writer.Write(creq, cbody);
+
+        wxString curl = base + _T("/shop/en/module/ocpermits/confirm");
+        wxString cresp;
+        long cCode = 0;
+        wxString cErr;
+        if (!HttpPostJson(curl, cbody, cresp, cCode, cErr)) {
+            wxLogMessage(_T("DpS63: /confirm failed (status %ld, %s); ")
+                         _T("activation still valid."),
+                         cCode, cErr.c_str());
+        } else {
+            //  Response { datetime, t = md5(datetime + salt) } -- verify the
+            //  token; mismatch is logged, not fatal (see step 3 rationale).
+            wxJSONValue croot;
+            wxJSONReader creader;
+            if (creader.Parse(cresp, &croot) == 0 &&
+                croot.HasMember("datetime")) {
+                wxString datetime = croot["datetime"].AsString();
+                wxString ctok = croot.HasMember("t") ? croot["t"].AsString()
+                                                     : wxString();
+                datetime.Trim().Trim(false);
+                ctok.Trim().Trim(false);
+                if (!ctok.IsEmpty()) {
+                    wxString expected = SencComputeToken(datetime);
+                    if (!expected.IsEmpty() &&
+                        !expected.IsSameAs(ctok, false)) {
+                        wxLogMessage(_T("DpS63: /confirm response token ")
+                                     _T("mismatch (got %s, expected %s)"),
+                                     ctok.c_str(), expected.c_str());
+                    }
+                }
+                wxLogMessage(_T("DpS63: activation confirmed at %s"),
+                             datetime.c_str());
+            } else {
+                wxLogMessage(_T("DpS63: /confirm response unreadable; ")
+                             _T("activation still valid."));
+            }
+        }
+    }
 
     stage(100, _("Done."));
     done(DpS63ActivationResult::SUCCESS, _("S63 charts activated."));
