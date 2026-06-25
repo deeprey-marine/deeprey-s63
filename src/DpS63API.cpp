@@ -469,12 +469,22 @@ void DpS63API::RequestActivation(ActivationProgressCallback onProgress,
         wxLogMessage(_T("DpS63: could not build /confirm token; ")
                      _T("skipping confirm (activation still valid)."));
     } else {
-        wxJSONValue creq;
-        creq["dev"] = deviceId;
-        creq["t"] = confirmTok;
-        wxJSONWriter writer(wxJSONWRITER_NONE);
-        wxString cbody;
-        writer.Write(creq, cbody);
+        //  Build the body by hand: the bundled wxJSONWriter (src/wxJSON) is
+        //  stubbed and serializes objects to an empty string, which the shop
+        //  rejects with HTTP 400 "Invalid JSON. Syntax error". deviceId is a
+        //  fleet serial and confirmTok a hex digest, but escape \ and " for
+        //  correctness.
+        auto jsonEscape = [](const wxString& s) {
+            wxString out;
+            for (size_t i = 0; i < s.Len(); ++i) {
+                if (s[i] == '\\' || s[i] == '"') out += '\\';
+                out += s[i];
+            }
+            return out;
+        };
+        wxString cbody = wxString::Format(
+            _T("{\"dev\":\"%s\",\"t\":\"%s\"}"),
+            jsonEscape(deviceId), jsonEscape(confirmTok));
 
         wxString curl = base + _T("/shop/en/module/ocpermits/confirm");
         wxString cresp;
