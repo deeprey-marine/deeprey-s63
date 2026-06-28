@@ -36,6 +36,13 @@
 #include <sys/stat.h>
 #include <algorithm>          // for std::sort
 
+#ifndef __WXMSW__
+#include <spawn.h>            // posix_spawn: thread-safe subprocess launch
+#include <sys/wait.h>         // waitpid
+#include <unistd.h>           // pipe, read, close
+extern char **environ;
+#endif
+
 #include "s63_pi.h"
 #include "s63chart.h"
 #include "mygeom63.h"
@@ -223,6 +230,64 @@ void validate_SENC_util(void)
 }
 
 
+#ifndef __WXMSW__
+// Run a shell command, capture stdout+stderr line-by-line into out_array, block
+// until the child exits. Uses posix_spawn, which is async-signal-safe and the
+// supported way to launch a subprocess from a MULTITHREADED program -- unlike
+// wxExecute(wxEXEC_SYNC), which wxWidgets forbids off the main thread (it drives
+// a GUI window-disabler + nested event loop and "deadlocks or crashes" on a
+// worker thread). This call touches no wx/GTK/event-loop state, so it is safe on
+// the OpenCPN chart-database worker thread (keeps the heavy work off the UI
+// thread -> UI stays responsive). Returns the child exit code, or -1 on failure.
+static long run_shell_capture( const wxString& cmd, wxArrayString& out_array )
+{
+    int pipefd[2];
+    if( pipe(pipefd) != 0 )
+        return -1;
+
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, pipefd[1], STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&fa, pipefd[1], STDERR_FILENO);
+    posix_spawn_file_actions_addclose(&fa, pipefd[0]);
+    posix_spawn_file_actions_addclose(&fa, pipefd[1]);
+
+    //  Run via /bin/sh -c so the command string (with quoted, space-bearing
+    //  paths) is parsed exactly as wxExecute used to parse it.
+    wxScopedCharBuffer cmdbuf = cmd.ToUTF8();
+    const char* argv[] = { "/bin/sh", "-c", cmdbuf.data(), nullptr };
+
+    pid_t pid = -1;
+    int spawn_rc = posix_spawn(&pid, "/bin/sh", &fa, nullptr,
+                               const_cast<char* const*>(argv), environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(pipefd[1]);                       // parent only reads
+
+    if( spawn_rc != 0 ) {
+        close(pipefd[0]);
+        return -1;
+    }
+
+    //  Drain the child's output.
+    wxString buf;
+    char tmp[4096];
+    ssize_t n;
+    while( (n = read(pipefd[0], tmp, sizeof(tmp))) > 0 )
+        buf += wxString::FromUTF8(tmp, n);
+    close(pipefd[0]);
+
+    int status = 0;
+    while( waitpid(pid, &status, 0) < 0 && errno == EINTR ) {}
+
+    //  Split into lines, preserving the trailing newline the callers expect.
+    wxStringTokenizer tk(buf, _T("\n"), wxTOKEN_RET_EMPTY);
+    while( tk.HasMoreTokens() )
+        out_array.Add( tk.GetNextToken() + _T("\n") );
+
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+#endif // !__WXMSW__
+
 wxArrayString exec_SENCutil_sync( wxString cmd, bool bshowlog )
 {
     wxArrayString ret_array;
@@ -253,17 +318,23 @@ wxArrayString exec_SENCutil_sync( wxString cmd, bool bshowlog )
     bool bsuppress_last = g_bsuppress_log;
     g_bsuppress_log = !bshowlog;
     
-    int flags = wxEXEC_SYNC;
-#ifdef __WXMSW__
-    //  If windows, we want to avoid disabling the currently active dialog.
-    //  Reason:  the wxExecute call yields after disabling the dialog UI, and
-    //  each yield seems to be recursive, so consuming GUI resources greatly
-    //  until the next full yield() and the event queue drains.
-    flags += wxEXEC_NODISABLE;
-#endif    
-    
-    long rv = wxExecute(cmd, ret_array, ret_array, flags );
-    
+    //  Run OCPNsenc and capture its output.
+    //
+    //  OpenCPN's threaded chart-database loader runs ChartS63::Init() ->
+    //  Build_eHDR()/BuildSENCFile() -> here on a BACKGROUND worker thread.
+    //  wxExecute() must NOT be called off the main thread (it drives a GUI
+    //  window-disabler + nested event loop; wxWidgets' own source asserts
+    //  "wxExecute() can be called only from the main thread" and warns it
+    //  "deadlocks or crashes"). That is exactly the s63 import crash/hang.
+    //  So on POSIX use posix_spawn (thread-safe, no wx/GTK), which keeps the
+    //  blocking on the worker thread and leaves the UI thread responsive.
+    long rv;
+#ifndef __WXMSW__
+    rv = run_shell_capture(cmd, ret_array);
+#else
+    rv = wxExecute(cmd, ret_array, ret_array, wxEXEC_SYNC | wxEXEC_NODISABLE);
+#endif
+
     g_bsuppress_log = bsuppress_last;
     
     if(-1 == rv) {
@@ -2660,9 +2731,13 @@ PI_InitReturn ChartS63::FindOrCreateSenc( const wxString& name )
 int ChartS63::BuildSENCFile( const wxString& FullPath_os63, const wxString& SENCFileName )
 {
     int retval = BUILD_SENC_OK;
-    
-    if(!g_bdisable_infowin){
-#ifdef __WXOSX__        
+
+    //  The "Building eSENC" info window is a GUI object and may only be created
+    //  on the main thread. When core builds this chart on a background worker
+    //  thread, skip the (purely cosmetic) progress window -- creating it there
+    //  would abort the process. Chart building itself is unaffected.
+    if(!g_bdisable_infowin && wxThread::IsMain()){
+#ifdef __WXOSX__
         g_pInfoDlg = new InfoWinDialog( GetOCPNCanvasWindow(), _("Building eSENC") );
         g_pInfoDlg->Realize();
         g_pInfoDlg->Center();
@@ -2670,7 +2745,7 @@ int ChartS63::BuildSENCFile( const wxString& FullPath_os63, const wxString& SENC
         g_pInfo = new InfoWin( GetOCPNCanvasWindow(), _("Building eSENC") );
         g_pInfo->Realize();
         g_pInfo->Center();
-#endif        
+#endif
     }
 
 #if 0    
@@ -2789,17 +2864,22 @@ int ChartS63::BuildSENCFile( const wxString& FullPath_os63, const wxString& SENC
     else
         retval = BUILD_SENC_OK;
     
-    if(g_pInfo){
-        g_pInfo->Destroy();
-        g_pInfo = NULL;
+    //  Only the main thread ever creates these GUI dialogs (guarded above), so
+    //  only the main thread destroys them -- a worker thread must not touch the
+    //  shared dialog pointers (Destroy() is a GUI/main-thread operation).
+    if(wxThread::IsMain()){
+        if(g_pInfo){
+            g_pInfo->Destroy();
+            g_pInfo = NULL;
+        }
+
+        if(g_pInfoDlg){
+            g_pInfoDlg->Destroy();
+            g_pInfoDlg = NULL;
+        }
     }
 
-    if(g_pInfoDlg){
-        g_pInfoDlg->Destroy();
-        g_pInfoDlg = NULL;
-    }
-    
-    
+
     return retval;
 }
 

@@ -1698,9 +1698,13 @@ int s63_pi::ImportCells( void )
                 //ScreenLogMessage(_T("Adding cell to database: ") + os63_filename + _T("\n"));
 
                 int rv_add = true;
-                // Add one chart to the database, in order to get the proper chart search directory added to the dB
-                if( !bDirAdded )
-                    bDirAdded |= (AddChartToDBInPlace( os63_filename, false ) > 0);
+                // Mark that at least one cell was installed. The chart database is
+                // updated ONCE after the loop via UpdateChartDBInplace() (see below).
+                // Do NOT use AddChartToDBInPlace() here: it tears down and rebuilds
+                // the global ChartDB inline -- spawning the threaded chart loader in
+                // the middle of the import -- which races the worker pool against the
+                // import thread and corrupts the heap (segfault).
+                bDirAdded = true;
                 if(!rv_add) {
                     ScreenLogMessage(_T("   Error adding cell to database: ") + os63_filename + _T("\n\n"));
                     b_error = true;
@@ -1793,6 +1797,26 @@ int s63_pi::ImportCells( void )
         }
     }
 
+    //  Make the freshly imported cells renderable with an in-place chart-database
+    //  update of the s63 chart directory. This MUST be deferred to a clean,
+    //  top-level event-loop context via CallAfter(): calling UpdateChartDBInplace()
+    //  inline here -- nested inside this import's wxYield()-pumping eSENC-build loop
+    //  -- re-enters OpenCPN's threaded chart loader and corrupts the heap (segfault).
+    //  The o-charts plugin (also a sub-118, non-thread-safe plugin) updates the DB
+    //  the same way: UpdateChartDBInplace(dirs, /*force*/true, false) from its clean
+    //  install-complete handler. Running after this whole import call stack unwinds
+    //  avoids the re-entrancy, and (the s63 plugin being loaded by now) lets the
+    //  cells finally become renderable. force_update=true forces a rescan of the
+    //  already-registered s63 directory so the new cells are actually picked up.
+    if( bDirAdded ){
+        wxString s63dir = os63_dirname;
+        wxTheApp->CallAfter( [s63dir]() {
+            wxArrayString dirs = GetChartDBDirArrayString();
+            if( dirs.Index( s63dir ) == wxNOT_FOUND )
+                dirs.Add( s63dir );
+            UpdateChartDBInplace( dirs, true, false );
+        } );
+    }
 
 finish:
     if(g_pprog){
@@ -2953,6 +2977,15 @@ void ScreenLogMessage(wxString s)
 
     if(g_bLogActivity)
         wxLogMessage(s);
+
+    //  The screen-log window is a GUI object: creating/updating it is only valid
+    //  on the main thread. OpenCPN's chart-database loader calls into ChartS63
+    //  (which logs through here) on a BACKGROUND worker thread; touching GTK
+    //  there aborts the process. wxLogMessage above is thread-safe (wx buffers
+    //  non-main-thread logs), so off the main thread we keep the log line but
+    //  skip the on-screen window entirely.
+    if(!wxThread::IsMain())
+        return;
 
     if(!g_benable_screenlog)
         return;
