@@ -171,6 +171,12 @@ public:
 private:
     wxString GetPermitDir();
 
+    //  Persistent local copy of imported ENC source cells, so that future eSENC
+    //  rebuilds work after the USB exchange set is removed (see PersistEncSource).
+    wxString GetEncSrcDir();
+    wxString PersistEncSource(const wxString& enc_root_dir,
+                              const wxString& rel_path);
+
     void CreateCatalog31(const wxString &file31);
 
     int ProcessCellPermit( wxString &permit, bool b_confirm_existing );

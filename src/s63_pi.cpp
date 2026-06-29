@@ -987,6 +987,38 @@ wxString s63_pi::GetPermitDir()
     return os63_dirname;
 }
 
+//  Root of the persistent local copy of imported ENC source cells.
+wxString s63_pi::GetEncSrcDir()
+{
+    wxString dir = g_CommonDataDir;
+    dir += _T("s63ENC");
+    return dir;
+}
+
+//  Copy an ENC source file (a .000 base or .NNN update) out of the (USB)
+//  exchange set into persistent local storage, mirroring its ENC_ROOT-relative
+//  sub-path, and return the LOCAL absolute path. The .os63 metadata stores this
+//  local path instead of the volatile USB path, so a later eSENC rebuild (e.g.
+//  after a SENC-format-version bump) still finds its source once the USB is
+//  gone. On any copy failure we fall back to the original source path, which
+//  preserves the previous behaviour (works while the USB is present).
+wxString s63_pi::PersistEncSource(const wxString& enc_root_dir,
+                                  const wxString& rel_path)
+{
+    wxString sep = wxFileName::GetPathSeparator();
+    wxString src = enc_root_dir + sep + rel_path;
+    wxString dst = GetEncSrcDir() + sep + rel_path;
+
+    wxFileName dstfn(dst);
+    if(!dstfn.DirExists())
+        wxFileName::Mkdir(dstfn.GetPath(), wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL);
+
+    if(::wxFileExists(src) && ::wxCopyFile(src, dst, true /*overwrite*/))
+        return dst;
+
+    return src;     // fallback: keep prior behaviour if the copy fails
+}
+
 
 void s63_pi::CreateCatalog31(const wxString &file31)
 {
@@ -1510,8 +1542,7 @@ int s63_pi::ImportCells( void )
                                     os63file.Clear();
                                     os63file.AddLine(line0);
                                     line = _T("cellbase:");
-                                    line += enc_root_dir + wxFileName::GetPathSeparator();
-                                    line += base_file_name;
+                                    line += PersistEncSource(enc_root_dir, base_file_name);
                                     line += _T(";");
                                     line += base_comt;
                                     os63file.AddLine(line);
@@ -1542,8 +1573,7 @@ int s63_pi::ImportCells( void )
                 }
                 else {                          // this must be an initial import
                     line = _T("cellbase:");
-                    line += enc_root_dir + wxFileName::GetPathSeparator();
-                    line += base_file_name;
+                    line += PersistEncSource(enc_root_dir, base_file_name);
                     line += _T(";");
                     line += base_comt;
                     os63file.AddLine(line);
@@ -1679,9 +1709,13 @@ int s63_pi::ImportCells( void )
                                                         // and be done with the update array
                             }
                             else {
+                                //  cell_array[i] is "<rel_path>;<comt>" -- persist
+                                //  the source file locally and keep the ";<comt>"
+                                //  suffix exactly as-is so the reader is unchanged.
+                                wxString up_rel = cell_array[i].BeforeFirst(';');
                                 line = _T("cellupdate:");
-                                line += enc_root_dir + wxFileName::GetPathSeparator();
-                                line += cell_array[i];
+                                line += PersistEncSource(enc_root_dir, up_rel);
+                                line += cell_array[i].Mid(up_rel.Length());
                                 os63file.AddLine(line);
                             }
                         }
